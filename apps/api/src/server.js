@@ -7,151 +7,35 @@ const { Pool } = pg;
 const app = express();
 app.use(cors());
 app.use(express.json());
-
 const port = Number(process.env.PORT || 3000);
 const databaseUrl = process.env.DATABASE_URL;
-const pool = databaseUrl ? new Pool({
-  connectionString: databaseUrl,
-  ssl: { rejectUnauthorized: false },
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-}) : null;
+const pool = databaseUrl ? new Pool({connectionString:databaseUrl,ssl:{rejectUnauthorized:false},max:10,idleTimeoutMillis:30000,connectionTimeoutMillis:10000}) : null;
 
-async function ensureSchema() {
-  if (!pool) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS wallets (
-      address TEXT PRIMARY KEY,
-      label TEXT DEFAULT 'Whale',
-      balance_sol NUMERIC DEFAULT 0,
-      realized_pnl_sol NUMERIC DEFAULT 0,
-      wins INTEGER DEFAULT 0,
-      losses INTEGER DEFAULT 0,
-      trades INTEGER DEFAULT 0,
-      first_seen_at TIMESTAMPTZ DEFAULT NOW(),
-      last_seen_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS tokens (
-      mint TEXT PRIMARY KEY,
-      symbol TEXT,
-      name TEXT,
-      image_url TEXT,
-      decimals INTEGER,
-      market_cap_usd NUMERIC,
-      price_usd NUMERIC,
-      liquidity_usd NUMERIC,
-      volume_24h_usd NUMERIC,
-      first_seen_at TIMESTAMPTZ DEFAULT NOW(),
-      last_seen_at TIMESTAMPTZ DEFAULT NOW(),
-      metadata JSONB DEFAULT '{}'::jsonb
-    );
-    CREATE TABLE IF NOT EXISTS whale_activity (
-      id BIGSERIAL PRIMARY KEY,
-      signature TEXT NOT NULL,
-      wallet_address TEXT NOT NULL REFERENCES wallets(address) ON DELETE CASCADE,
-      mint TEXT REFERENCES tokens(mint) ON DELETE SET NULL,
-      action TEXT NOT NULL,
-      token_amount NUMERIC DEFAULT 0,
-      sol_amount NUMERIC DEFAULT 0,
-      timestamp TIMESTAMPTZ NOT NULL,
-      raw JSONB DEFAULT '{}'::jsonb
-    );
-    CREATE INDEX IF NOT EXISTS idx_whale_activity_time ON whale_activity(timestamp DESC);
-    CREATE INDEX IF NOT EXISTS idx_whale_activity_wallet ON whale_activity(wallet_address,timestamp DESC);
-    CREATE INDEX IF NOT EXISTS idx_whale_activity_mint ON whale_activity(mint,timestamp DESC);
-    CREATE INDEX IF NOT EXISTS idx_tokens_market_cap ON tokens(market_cap_usd);
-  `);
-}
+async function ensureSchema(){if(!pool)return;await pool.query(`
+CREATE TABLE IF NOT EXISTS wallets(address TEXT PRIMARY KEY,label TEXT DEFAULT 'Whale',balance_sol NUMERIC DEFAULT 0,realized_pnl_sol NUMERIC DEFAULT 0,wins INTEGER DEFAULT 0,losses INTEGER DEFAULT 0,trades INTEGER DEFAULT 0,first_seen_at TIMESTAMPTZ DEFAULT NOW(),last_seen_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS tokens(mint TEXT PRIMARY KEY,symbol TEXT,name TEXT,image_url TEXT,decimals INTEGER,market_cap_usd NUMERIC,price_usd NUMERIC,liquidity_usd NUMERIC,volume_24h_usd NUMERIC,first_seen_at TIMESTAMPTZ DEFAULT NOW(),last_seen_at TIMESTAMPTZ DEFAULT NOW(),metadata JSONB DEFAULT '{}'::jsonb);
+CREATE TABLE IF NOT EXISTS whale_activity(id BIGSERIAL PRIMARY KEY,signature TEXT NOT NULL,wallet_address TEXT NOT NULL REFERENCES wallets(address) ON DELETE CASCADE,mint TEXT REFERENCES tokens(mint) ON DELETE SET NULL,action TEXT NOT NULL,token_amount NUMERIC DEFAULT 0,sol_amount NUMERIC DEFAULT 0,timestamp TIMESTAMPTZ NOT NULL,raw JSONB DEFAULT '{}'::jsonb);
+CREATE INDEX IF NOT EXISTS idx_whale_activity_time ON whale_activity(timestamp DESC);CREATE INDEX IF NOT EXISTS idx_whale_activity_wallet ON whale_activity(wallet_address,timestamp DESC);CREATE INDEX IF NOT EXISTS idx_whale_activity_mint ON whale_activity(mint,timestamp DESC);CREATE INDEX IF NOT EXISTS idx_tokens_market_cap ON tokens(market_cap_usd);
+CREATE TABLE IF NOT EXISTS wallet_scores(address TEXT PRIMARY KEY REFERENCES wallets(address) ON DELETE CASCADE,score NUMERIC DEFAULT 0,grade TEXT DEFAULT 'UNRANKED',confidence NUMERIC DEFAULT 0,win_rate NUMERIC DEFAULT 0,activity_score NUMERIC DEFAULT 0,consistency_score NUMERIC DEFAULT 0,profit_score NUMERIC DEFAULT 0,early_entry_score NUMERIC DEFAULT 0,trade_count INTEGER DEFAULT 0,unique_tokens INTEGER DEFAULT 0,computed_at TIMESTAMPTZ DEFAULT NOW());
+CREATE INDEX IF NOT EXISTS idx_wallet_scores_score ON wallet_scores(score DESC);CREATE INDEX IF NOT EXISTS idx_wallet_scores_grade ON wallet_scores(grade);
+`);}
 
-app.get("/", (_req,res) => res.json({ service:"Solana Alpha Terminal API", status:"online", version:"0.3.1" }));
+function clamp(n,min=0,max=100){return Math.max(min,Math.min(max,n));}
+function grade(score,confidence,trades){if(trades<3||confidence<25)return "UNRANKED";if(score>=85)return "ELITE";if(score>=70)return "SMART_MONEY";if(score>=55)return "WHALE";if(score>=35)return "ACTIVE";return "RISKY";}
 
-app.get("/api/health", async (_req,res) => {
-  let database = "not configured", databaseError = null, databaseErrorCode = null;
-  if (pool) {
-    try { await pool.query("SELECT 1"); database = "connected"; }
-    catch (error) {
-      database = "error";
-      databaseError = error instanceof Error ? error.message : String(error);
-      databaseErrorCode = error && typeof error === "object" && "code" in error ? error.code : null;
-      console.error("Database health check failed:", error);
-    }
-  }
-  res.json({ status:database === "connected" ? "ok" : "degraded", heliusConfigured:Boolean(process.env.HELIUS_API_KEY), database, ...(databaseError ? {databaseError} : {}), ...(databaseErrorCode ? {databaseErrorCode} : {}), timestamp:new Date().toISOString() });
-});
+async function computeSmartMoneyScores(){if(!pool)return;const wallets=await pool.query(`SELECT w.address,w.balance_sol,w.first_seen_at,w.last_seen_at,COUNT(a.id)::int AS trades,COUNT(DISTINCT a.mint)::int AS unique_tokens,COALESCE(SUM(CASE WHEN a.action='BUY' THEN a.sol_amount ELSE 0 END),0)::numeric AS buy_sol,COALESCE(SUM(CASE WHEN a.action='SELL' THEN a.sol_amount ELSE 0 END),0)::numeric AS sell_sol,COUNT(*) FILTER(WHERE a.action='BUY')::int AS buys,COUNT(*) FILTER(WHERE a.action='SELL')::int AS sells,COUNT(DISTINCT DATE(a.timestamp))::int AS active_days FROM wallets w LEFT JOIN whale_activity a ON a.wallet_address=w.address GROUP BY w.address,w.balance_sol,w.first_seen_at,w.last_seen_at`);
+for(const w of wallets.rows){const trades=Number(w.trades||0),buys=Number(w.buys||0),sells=Number(w.sells||0),buySol=Number(w.buy_sol||0),sellSol=Number(w.sell_sol||0),activeDays=Number(w.active_days||0),uniqueTokens=Number(w.unique_tokens||0);const paired=Math.min(buys,sells);const winRate=paired>0?clamp((paired/Math.max(buys,1))*100):0;const netFlow=sellSol-buySol;const profitScore=clamp(50+netFlow*5);const activityScore=clamp(Math.log1p(trades)*18);const consistencyScore=clamp(activeDays*10);const earlyEntryScore=clamp(Math.min(uniqueTokens,20)*3);const confidence=clamp(trades*4+paired*5+activeDays*3);const score=clamp(profitScore*.30+winRate*.25+activityScore*.15+consistencyScore*.10+earlyEntryScore*.20);const g=grade(score,confidence,trades);await pool.query(`INSERT INTO wallet_scores(address,score,grade,confidence,win_rate,activity_score,consistency_score,profit_score,early_entry_score,trade_count,unique_tokens,computed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) ON CONFLICT(address) DO UPDATE SET score=EXCLUDED.score,grade=EXCLUDED.grade,confidence=EXCLUDED.confidence,win_rate=EXCLUDED.win_rate,activity_score=EXCLUDED.activity_score,consistency_score=EXCLUDED.consistency_score,profit_score=EXCLUDED.profit_score,early_entry_score=EXCLUDED.early_entry_score,trade_count=EXCLUDED.trade_count,unique_tokens=EXCLUDED.unique_tokens,computed_at=NOW()`,[w.address,Number(score.toFixed(2)),g,Number(confidence.toFixed(2)),Number(winRate.toFixed(2)),Number(activityScore.toFixed(2)),Number(consistencyScore.toFixed(2)),Number(profitScore.toFixed(2)),Number(earlyEntryScore.toFixed(2)),trades,uniqueTokens]);}}
 
-app.get("/api/ingestion/status", async (_req,res) => {
-  try {
-    let counts = { wallets:0, tokens:0, activities:0 };
-    if (pool) {
-      const [wallets,tokens,activities] = await Promise.all([
-        pool.query("SELECT COUNT(*)::int AS count FROM wallets"),
-        pool.query("SELECT COUNT(*)::int AS count FROM tokens"),
-        pool.query("SELECT COUNT(*)::int AS count FROM whale_activity"),
-      ]);
-      counts = { wallets:wallets.rows[0].count, tokens:tokens.rows[0].count, activities:activities.rows[0].count };
-    }
-    res.json({ serviceVersion:"0.3.1", heliusConfigured:Boolean(process.env.HELIUS_API_KEY), databaseConfigured:Boolean(pool), ...ingestionState, counts });
-  } catch (error) {
-    res.status(500).json({ error: error instanceof Error ? error.message : String(error), ...ingestionState });
-  }
-});
+app.get("/",(_req,res)=>res.json({service:"Solana Alpha Terminal API",status:"online",version:"0.4.0"}));
+app.get("/api/health",async(_req,res)=>{let database="not configured",databaseError=null,databaseErrorCode=null;if(pool){try{await pool.query("SELECT 1");database="connected"}catch(error){database="error";databaseError=error instanceof Error?error.message:String(error);databaseErrorCode=error&&typeof error==="object"&&"code"in error?error.code:null;}}res.json({status:database==="connected"?"ok":"degraded",heliusConfigured:Boolean(process.env.HELIUS_API_KEY),database,...(databaseError?{databaseError}:{}),...(databaseErrorCode?{databaseErrorCode}:{}),timestamp:new Date().toISOString()});});
+app.get("/api/ingestion/status",async(_req,res)=>{try{let counts={wallets:0,tokens:0,activities:0,scores:0};if(pool){const [a,b,c,d]=await Promise.all([pool.query("SELECT COUNT(*)::int AS count FROM wallets"),pool.query("SELECT COUNT(*)::int AS count FROM tokens"),pool.query("SELECT COUNT(*)::int AS count FROM whale_activity"),pool.query("SELECT COUNT(*)::int AS count FROM wallet_scores")]);counts={wallets:a.rows[0].count,tokens:b.rows[0].count,activities:c.rows[0].count,scores:d.rows[0].count};}res.json({serviceVersion:"0.4.0",heliusConfigured:Boolean(process.env.HELIUS_API_KEY),databaseConfigured:Boolean(pool),...ingestionState,counts});}catch(error){res.status(500).json({error:error instanceof Error?error.message:String(error),...ingestionState});}});
+app.post("/api/ingestion/run",async(_req,res)=>{if(!pool)return res.status(503).json({error:"Database not configured"});if(ingestionState.running)return res.status(202).json({status:"already-running",...ingestionState});runIngestionCycle(pool).catch(error=>console.error("Manual ingestion failed:",error));res.status(202).json({status:"started",...ingestionState});});
+app.get("/api/whales",async(req,res)=>{if(!pool)return res.status(503).json({data:[],error:"Database not configured"});const limit=Math.min(Math.max(Number(req.query.limit)||200,1),500),offset=Math.max(Number(req.query.offset)||0,0);const result=await pool.query(`SELECT w.address,w.label,w.balance_sol,w.realized_pnl_sol,w.wins,w.losses,w.trades,w.last_seen_at,s.score,s.grade,s.confidence,s.win_rate FROM wallets w LEFT JOIN wallet_scores s ON s.address=w.address ORDER BY COALESCE(s.score,0) DESC,w.balance_sol DESC NULLS LAST LIMIT $1 OFFSET $2`,[limit,offset]);const total=await pool.query("SELECT COUNT(*)::int AS count FROM wallets");res.json({data:result.rows,page:Math.floor(offset/limit)+1,limit,total:Number(total.rows[0].count)});});
+app.get("/api/whales/activity",async(req,res)=>{if(!pool)return res.status(503).json({data:[]});const limit=Math.min(Math.max(Number(req.query.limit)||200,1),500);const result=await pool.query(`SELECT a.signature,a.wallet_address,a.mint,t.symbol,t.name,t.image_url,a.action,a.token_amount,a.sol_amount,a.timestamp FROM whale_activity a LEFT JOIN tokens t ON t.mint=a.mint ORDER BY a.timestamp DESC LIMIT $1`,[limit]);res.json({data:result.rows,limit});});
+app.get("/api/whales/today",async(_req,res)=>{if(!pool)return res.status(503).json({data:[]});const result=await pool.query(`SELECT wallet_address,COUNT(*)::int AS trades,COALESCE(SUM(CASE WHEN action='BUY' THEN sol_amount ELSE 0 END),0) AS buy_sol,COALESCE(SUM(CASE WHEN action='SELL' THEN sol_amount ELSE 0 END),0) AS sell_sol,COALESCE(SUM(CASE WHEN action='SELL' THEN sol_amount ELSE -sol_amount END),0) AS net_flow_sol FROM whale_activity WHERE timestamp>=CURRENT_DATE GROUP BY wallet_address ORDER BY net_flow_sol DESC LIMIT 200`);res.json({data:result.rows});});
+app.get("/api/smart-wallets",async(req,res)=>{if(!pool)return res.status(503).json({data:[]});const limit=Math.min(Math.max(Number(req.query.limit)||100,1),500);const result=await pool.query(`SELECT w.address,w.balance_sol,w.realized_pnl_sol,w.wins,w.losses,w.trades,s.score,s.grade,s.confidence,s.win_rate,s.activity_score,s.consistency_score,s.profit_score,s.early_entry_score,s.unique_tokens,s.computed_at FROM wallets w JOIN wallet_scores s ON s.address=w.address WHERE s.grade<> 'UNRANKED' ORDER BY s.score DESC LIMIT $1`,[limit]);res.json({data:result.rows,limit});});
+app.get("/api/wallets/:address",async(req,res)=>{if(!pool)return res.status(503).json({error:"Database not configured"});const wallet=await pool.query(`SELECT w.*,s.score,s.grade,s.confidence,s.win_rate,s.activity_score,s.consistency_score,s.profit_score,s.early_entry_score,s.unique_tokens,s.computed_at FROM wallets w LEFT JOIN wallet_scores s ON s.address=w.address WHERE w.address=$1`,[req.params.address]);if(!wallet.rowCount)return res.status(404).json({error:"Wallet not indexed"});const activity=await pool.query(`SELECT a.signature,a.mint,t.symbol,t.name,t.image_url,a.action,a.token_amount,a.sol_amount,a.timestamp FROM whale_activity a LEFT JOIN tokens t ON t.mint=a.mint WHERE a.wallet_address=$1 ORDER BY a.timestamp DESC LIMIT 200`,[req.params.address]);res.json({...wallet.rows[0],activity:activity.rows});});
+app.get("/api/tokens",async(req,res)=>{if(!pool)return res.status(503).json({data:[]});const limit=Math.min(Math.max(Number(req.query.limit)||200,1),500),maxMarketCap=req.query.maxMarketCap?Number(req.query.maxMarketCap):null;const result=await pool.query(`SELECT mint,symbol,name,image_url,decimals,market_cap_usd,price_usd,liquidity_usd,volume_24h_usd,first_seen_at,last_seen_at FROM tokens WHERE ($1::numeric IS NULL OR market_cap_usd IS NULL OR market_cap_usd<=$1) ORDER BY last_seen_at DESC LIMIT $2`,[maxMarketCap,limit]);res.json({data:result.rows,limit,maxMarketCap});});
+app.get("/api/tokens/:mint",async(req,res)=>{if(!pool)return res.status(503).json({error:"Database not configured"});const result=await pool.query("SELECT * FROM tokens WHERE mint=$1",[req.params.mint]);if(!result.rowCount)return res.status(404).json({error:"Token not indexed yet"});res.json(result.rows[0]);});
 
-app.post("/api/ingestion/run", async (_req,res) => {
-  if (!pool) return res.status(503).json({ error:"Database not configured" });
-  if (ingestionState.running) return res.status(202).json({ status:"already-running", ...ingestionState });
-  runIngestionCycle(pool).catch(error => console.error("Manual ingestion failed:",error));
-  res.status(202).json({ status:"started", ...ingestionState });
-});
-
-app.get("/api/whales", async (req,res) => {
-  if (!pool) return res.status(503).json({data:[],error:"Database not configured"});
-  const limit = Math.min(Math.max(Number(req.query.limit) || 200,1),500);
-  const offset = Math.max(Number(req.query.offset) || 0,0);
-  const result = await pool.query(`SELECT address,label,balance_sol,realized_pnl_sol,wins,losses,trades,last_seen_at FROM wallets ORDER BY balance_sol DESC NULLS LAST,last_seen_at DESC LIMIT $1 OFFSET $2`,[limit,offset]);
-  const total = await pool.query("SELECT COUNT(*)::int AS count FROM wallets");
-  res.json({data:result.rows,page:Math.floor(offset/limit)+1,limit,total:Number(total.rows[0].count)});
-});
-
-app.get("/api/whales/activity", async (req,res) => {
-  if (!pool) return res.status(503).json({data:[]});
-  const limit = Math.min(Math.max(Number(req.query.limit) || 200,1),500);
-  const result = await pool.query(`SELECT a.signature,a.wallet_address,a.mint,t.symbol,t.name,t.image_url,a.action,a.token_amount,a.sol_amount,a.timestamp FROM whale_activity a LEFT JOIN tokens t ON t.mint=a.mint ORDER BY a.timestamp DESC LIMIT $1`,[limit]);
-  res.json({data:result.rows,limit});
-});
-
-app.get("/api/whales/today", async (_req,res) => {
-  if (!pool) return res.status(503).json({data:[]});
-  const result = await pool.query(`SELECT wallet_address,COUNT(*)::int AS trades,COALESCE(SUM(CASE WHEN action='BUY' THEN sol_amount ELSE 0 END),0) AS buy_sol,COALESCE(SUM(CASE WHEN action='SELL' THEN sol_amount ELSE 0 END),0) AS sell_sol,COALESCE(SUM(CASE WHEN action='SELL' THEN sol_amount ELSE -sol_amount END),0) AS net_flow_sol FROM whale_activity WHERE timestamp >= CURRENT_DATE GROUP BY wallet_address ORDER BY net_flow_sol DESC LIMIT 200`);
-  res.json({data:result.rows});
-});
-
-app.get("/api/tokens", async (req,res) => {
-  if (!pool) return res.status(503).json({data:[]});
-  const limit = Math.min(Math.max(Number(req.query.limit) || 200,1),500);
-  const maxMarketCap = req.query.maxMarketCap ? Number(req.query.maxMarketCap) : null;
-  const result = await pool.query(`SELECT mint,symbol,name,image_url,decimals,market_cap_usd,price_usd,liquidity_usd,volume_24h_usd,first_seen_at,last_seen_at FROM tokens WHERE ($1::numeric IS NULL OR market_cap_usd IS NULL OR market_cap_usd <= $1) ORDER BY last_seen_at DESC LIMIT $2`,[maxMarketCap,limit]);
-  res.json({data:result.rows,limit,maxMarketCap});
-});
-
-app.get("/api/smart-wallets", async (_req,res) => {
-  if (!pool) return res.status(503).json({data:[]});
-  const result = await pool.query(`SELECT address,balance_sol,realized_pnl_sol,wins,losses,trades,CASE WHEN trades>0 THEN ROUND((wins::numeric/trades::numeric)*100,2) ELSE 0 END AS win_rate FROM wallets ORDER BY realized_pnl_sol DESC NULLS LAST,win_rate DESC LIMIT 200`);
-  res.json({data:result.rows});
-});
-
-app.get("/api/tokens/:mint", async (req,res) => {
-  if (!pool) return res.status(503).json({error:"Database not configured"});
-  const result = await pool.query("SELECT * FROM tokens WHERE mint=$1",[req.params.mint]);
-  if (!result.rowCount) return res.status(404).json({error:"Token not indexed yet"});
-  res.json(result.rows[0]);
-});
-
-app.listen(port,async () => {
-  console.log(`Solana Alpha Terminal API listening on port ${port}`);
-  if (pool) {
-    try { await ensureSchema(); startIngestion(pool); console.log("Live Solana ingestion engine started"); }
-    catch (error) { console.error("Failed to start ingestion engine:",error); }
-  }
-});
+app.listen(port,async()=>{console.log(`Solana Alpha Terminal API listening on port ${port}`);if(pool){try{await ensureSchema();startIngestion(pool);setInterval(()=>computeSmartMoneyScores().catch(e=>console.error("Smart money scoring failed:",e)),60000);setTimeout(()=>computeSmartMoneyScores().catch(e=>console.error("Initial smart money scoring failed:",e)),15000);console.log("Live Solana ingestion and smart money scoring started");}catch(error){console.error("Failed to start ingestion engine:",error);}}});
