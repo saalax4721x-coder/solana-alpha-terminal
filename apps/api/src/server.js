@@ -25,13 +25,14 @@ app.get("/", (_req, res) => {
   res.json({
     service: "Solana Alpha Terminal API",
     status: "online",
-    version: "0.1.1",
+    version: "0.1.2",
   });
 });
 
 app.get("/api/health", async (_req, res) => {
   let database = "not configured";
   let databaseError = null;
+  let databaseErrorCode = null;
 
   if (pool) {
     try {
@@ -40,6 +41,7 @@ app.get("/api/health", async (_req, res) => {
     } catch (error) {
       database = "error";
       databaseError = error instanceof Error ? error.message : String(error);
+      databaseErrorCode = error && typeof error === "object" && "code" in error ? error.code : null;
       console.error("Database health check failed:", error);
     }
   }
@@ -49,6 +51,7 @@ app.get("/api/health", async (_req, res) => {
     heliusConfigured: Boolean(process.env.HELIUS_API_KEY),
     database,
     ...(databaseError ? { databaseError } : {}),
+    ...(databaseErrorCode ? { databaseErrorCode } : {}),
     timestamp: new Date().toISOString(),
   });
 });
