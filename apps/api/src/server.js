@@ -65,7 +65,7 @@ async function ensureSchema() {
   `);
 }
 
-app.get("/", (_req,res) => res.json({ service:"Solana Alpha Terminal API", status:"online", version:"0.3.0" }));
+app.get("/", (_req,res) => res.json({ service:"Solana Alpha Terminal API", status:"online", version:"0.3.1" }));
 
 app.get("/api/health", async (_req,res) => {
   let database = "not configured", databaseError = null, databaseErrorCode = null;
@@ -82,16 +82,20 @@ app.get("/api/health", async (_req,res) => {
 });
 
 app.get("/api/ingestion/status", async (_req,res) => {
-  let counts = { wallets:0, tokens:0, activities:0 };
-  if (pool) {
-    const [wallets,tokens,activities] = await Promise.all([
-      pool.query("SELECT COUNT(*)::int AS count FROM wallets"),
-      pool.query("SELECT COUNT(*)::int AS count FROM tokens"),
-      pool.query("SELECT COUNT(*)::int AS count FROM whale_activity"),
-    ]);
-    counts = { wallets:wallets.rows[0].count, tokens:tokens.rows[0].count, activities:activities.rows[0].count };
+  try {
+    let counts = { wallets:0, tokens:0, activities:0 };
+    if (pool) {
+      const [wallets,tokens,activities] = await Promise.all([
+        pool.query("SELECT COUNT(*)::int AS count FROM wallets"),
+        pool.query("SELECT COUNT(*)::int AS count FROM tokens"),
+        pool.query("SELECT COUNT(*)::int AS count FROM whale_activity"),
+      ]);
+      counts = { wallets:wallets.rows[0].count, tokens:tokens.rows[0].count, activities:activities.rows[0].count };
+    }
+    res.json({ serviceVersion:"0.3.1", heliusConfigured:Boolean(process.env.HELIUS_API_KEY), databaseConfigured:Boolean(pool), ...ingestionState, counts });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error), ...ingestionState });
   }
-  res.json({ heliusConfigured:Boolean(process.env.HELIUS_API_KEY), databaseConfigured:Boolean(pool), ...ingestionState, counts });
 });
 
 app.post("/api/ingestion/run", async (_req,res) => {
