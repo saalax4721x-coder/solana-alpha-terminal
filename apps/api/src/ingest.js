@@ -1,22 +1,30 @@
-import { Connection } from "@solana/web3.js";
-
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 const RPC_URL = process.env.HELIUS_RPC_URL || (HELIUS_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}` : "https://api.mainnet-beta.solana.com");
-const connection = new Connection(RPC_URL, "confirmed");
-const HELIUS_TX_URL = HELIUS_KEY ? `https://api.helius.xyz/v0/addresses/{address}/transactions?api-key=${HELIUS_KEY}&limit=20` : null;
-const HELIUS_RPC_URL = HELIUS_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}` : null;
+const HELIUS_TX_BASE = HELIUS_KEY ? `https://api.helius.xyz/v0/addresses` : null;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+export const ingestionState = {
+  running: false,
+  startedAt: null,
+  lastRunAt: null,
+  lastSuccessAt: null,
+  lastError: null,
+  walletsDiscovered: 0,
+  walletsTracked: 0,
+  activitiesInserted: 0,
+  freshTokensDiscovered: 0,
+};
+
 async function rpc(method, params = []) {
-  if (!HELIUS_RPC_URL) return null;
-  const response = await fetch(HELIUS_RPC_URL, {
+  const response = await fetch(RPC_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
   });
-  if (!response.ok) throw new Error(`Helius RPC ${response.status}`);
-  const json = await response.json();
-  if (json.error) throw new Error(json.error.message || "Helius RPC error");
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Solana RPC ${response.status}: ${text.slice(0, 300)}`);
+  const json = JSON.parse(text);
+  if (json.error) throw new Error(json.error.message || "Solana RPC error");
   return json.result;
 }
 
@@ -59,40 +67,52 @@ async function ensureSchema(pool) {
       timestamp TIMESTAMPTZ NOT NULL,
       raw JSONB DEFAULT '{}'::jsonb
     );
-    ALTER TABLE whale_activity DROP CONSTRAINT IF EXISTS whale_activity_signature_key;
     CREATE UNIQUE INDEX IF NOT EXISTS whale_activity_dedupe ON whale_activity(signature,wallet_address,mint,action);
     CREATE INDEX IF NOT EXISTS idx_whale_activity_time ON whale_activity(timestamp DESC);
-    CREATE INDEX IF NOT EXISTS idx_whale_activity_wallet ON whale_activity(wallet_address, timestamp DESC);
-    CREATE INDEX IF NOT EXISTS idx_whale_activity_mint ON whale_activity(mint, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_whale_activity_wallet ON whale_activity(wallet_address,timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_whale_activity_mint ON whale_activity(mint,timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_tokens_market_cap ON tokens(market_cap_usd);
   `);
 }
 
 async function discoverInitialWallets(pool) {
-  const result = await connection.getLargestAccounts({ commitment: "confirmed" });
-  for (const account of result.value) {
-    await pool.query(
+  const result = await rpc("getLargestAccounts", [{ commitment: "confirmed" }]);
+  const accounts = Array.isArray(result?.value) ? result.value.slice(0, 200) : [];
+  let saved = 0;
+  for (const account of accounts) {
+    const address = String(account.address);
+    const balance = Number(account.lamports || 0) / 1e9;
+    const result = await pool.query(
       `INSERT INTO wallets(address,label,balance_sol,last_seen_at,updated_at)
        VALUES($1,'Whale',$2,NOW(),NOW())
-       ON CONFLICT(address) DO UPDATE SET balance_sol=EXCLUDED.balance_sol,updated_at=NOW()`,
-      [account.address.toString(), Number(account.lamports) / 1e9]
+       ON CONFLICT(address) DO UPDATE SET balance_sol=EXCLUDED.balance_sol,last_seen_at=NOW(),updated_at=NOW()`,
+      [address, balance]
     );
+    if (result.rowCount) saved++;
   }
 
   const configured = (process.env.TRACKED_WALLETS || "")
     .split(",").map((x) => x.trim()).filter(Boolean).slice(0, 500);
   for (const address of configured) {
     await pool.query(
-      `INSERT INTO wallets(address,label,last_seen_at,updated_at) VALUES($1,'Tracked',NOW(),NOW()) ON CONFLICT(address) DO NOTHING`,
+      `INSERT INTO wallets(address,label,last_seen_at,updated_at)
+       VALUES($1,'Tracked',NOW(),NOW()) ON CONFLICT(address) DO NOTHING`,
       [address]
     );
   }
+
+  ingestionState.walletsDiscovered = accounts.length;
+  return saved;
 }
 
 async function fetchWalletTransactions(address) {
-  if (!HELIUS_TX_URL) return [];
-  const response = await fetch(HELIUS_TX_URL.replace("{address}", address));
-  if (!response.ok) throw new Error(`Helius transactions ${response.status}`);
-  return response.json();
+  if (!HELIUS_TX_BASE) return [];
+  const url = `${HELIUS_TX_BASE}/${encodeURIComponent(address)}/transactions?api-key=${encodeURIComponent(HELIUS_KEY)}&limit=20`;
+  const response = await fetch(url);
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Helius transactions ${response.status}: ${text.slice(0, 300)}`);
+  const json = JSON.parse(text);
+  return Array.isArray(json) ? json : [];
 }
 
 async function getTokenMetadata(mint) {
@@ -106,15 +126,13 @@ async function getTokenMetadata(mint) {
     let market = {};
     if (marketResponse?.ok) {
       const json = await marketResponse.json();
-      const pair = (json.pairs || []).sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0))[0];
+      const pair = (json.pairs || []).sort((a,b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0))[0];
       if (pair) {
         market = {
           price_usd: Number(pair.priceUsd || 0) || null,
           liquidity_usd: Number(pair.liquidity?.usd || 0) || null,
           volume_24h_usd: Number(pair.volume?.h24 || 0) || null,
           market_cap_usd: Number(pair.marketCap || pair.fdv || 0) || null,
-          dex: pair.dexId || null,
-          pair_address: pair.pairAddress || null,
         };
       }
     }
@@ -126,27 +144,23 @@ async function getTokenMetadata(mint) {
       ...market,
       metadata: asset || {},
     };
-  } catch {
-    return { symbol: null, name: null, image_url: null, decimals: null, price_usd: null, liquidity_usd: null, volume_24h_usd: null, market_cap_usd: null, metadata: {} };
+  } catch (error) {
+    console.warn(`Token metadata failed for ${mint}:`, error.message || error);
+    return { symbol:null,name:null,image_url:null,decimals:null,price_usd:null,liquidity_usd:null,volume_24h_usd:null,market_cap_usd:null,metadata:{} };
   }
 }
 
 async function upsertToken(pool, mint) {
-  const existing = await pool.query("SELECT mint FROM tokens WHERE mint=$1", [mint]);
   const metadata = await getTokenMetadata(mint);
-  if (existing.rowCount) {
-    await pool.query(
-      `UPDATE tokens SET symbol=COALESCE($2,symbol),name=COALESCE($3,name),image_url=COALESCE($4,image_url),
-       decimals=COALESCE($5,decimals),market_cap_usd=COALESCE($6,market_cap_usd),price_usd=COALESCE($7,price_usd),
-       liquidity_usd=COALESCE($8,liquidity_usd),volume_24h_usd=COALESCE($9,volume_24h_usd),metadata=$10,last_seen_at=NOW() WHERE mint=$1`,
-      [mint, metadata.symbol, metadata.name, metadata.image_url, metadata.decimals, metadata.market_cap_usd, metadata.price_usd, metadata.liquidity_usd, metadata.volume_24h_usd, JSON.stringify(metadata.metadata)]
-    );
-    return;
-  }
   await pool.query(
     `INSERT INTO tokens(mint,symbol,name,image_url,decimals,market_cap_usd,price_usd,liquidity_usd,volume_24h_usd,metadata,last_seen_at)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) ON CONFLICT(mint) DO NOTHING`,
-    [mint, metadata.symbol, metadata.name, metadata.image_url, metadata.decimals, metadata.market_cap_usd, metadata.price_usd, metadata.liquidity_usd, metadata.volume_24h_usd, JSON.stringify(metadata.metadata)]
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+     ON CONFLICT(mint) DO UPDATE SET
+       symbol=COALESCE(EXCLUDED.symbol,tokens.symbol), name=COALESCE(EXCLUDED.name,tokens.name), image_url=COALESCE(EXCLUDED.image_url,tokens.image_url),
+       decimals=COALESCE(EXCLUDED.decimals,tokens.decimals), market_cap_usd=COALESCE(EXCLUDED.market_cap_usd,tokens.market_cap_usd),
+       price_usd=COALESCE(EXCLUDED.price_usd,tokens.price_usd), liquidity_usd=COALESCE(EXCLUDED.liquidity_usd,tokens.liquidity_usd),
+       volume_24h_usd=COALESCE(EXCLUDED.volume_24h_usd,tokens.volume_24h_usd), metadata=EXCLUDED.metadata, last_seen_at=NOW()`,
+    [mint,metadata.symbol,metadata.name,metadata.image_url,metadata.decimals,metadata.market_cap_usd,metadata.price_usd,metadata.liquidity_usd,metadata.volume_24h_usd,JSON.stringify(metadata.metadata)]
   );
 }
 
@@ -160,7 +174,7 @@ async function indexCounterparties(pool, tx, wallet) {
     if (x.fromUserAccount && x.fromUserAccount !== wallet) addresses.add(x.fromUserAccount);
     if (x.toUserAccount && x.toUserAccount !== wallet) addresses.add(x.toUserAccount);
   }
-  for (const address of [...addresses].slice(0, 25)) {
+  for (const address of [...addresses].slice(0,25)) {
     await pool.query(
       `INSERT INTO wallets(address,label,last_seen_at,updated_at) VALUES($1,'Observed',NOW(),NOW()) ON CONFLICT(address) DO UPDATE SET last_seen_at=NOW(),updated_at=NOW()`,
       [address]
@@ -172,23 +186,15 @@ function parseActivities(wallet, tx) {
   const timestamp = tx.timestamp ? new Date(tx.timestamp * 1000) : new Date();
   const transfers = Array.isArray(tx.tokenTransfers) ? tx.tokenTransfers : [];
   const native = Array.isArray(tx.nativeTransfers) ? tx.nativeTransfers : [];
-  const solOut = native.filter((x) => x.fromUserAccount === wallet).reduce((sum, x) => sum + Number(x.amount || 0), 0) / 1e9;
-  const solIn = native.filter((x) => x.toUserAccount === wallet).reduce((sum, x) => sum + Number(x.amount || 0), 0) / 1e9;
+  const solOut = native.filter(x => x.fromUserAccount === wallet).reduce((sum,x) => sum + Number(x.amount || 0),0) / 1e9;
+  const solIn = native.filter(x => x.toUserAccount === wallet).reduce((sum,x) => sum + Number(x.amount || 0),0) / 1e9;
   const netSol = solOut - solIn;
   if (tx.type !== "SWAP" && !transfers.length) return [];
-  return transfers.map((transfer) => {
+  return transfers.map(transfer => {
     const incoming = transfer.toUserAccount === wallet;
     const outgoing = transfer.fromUserAccount === wallet;
     if (!incoming && !outgoing) return null;
-    return {
-      signature: tx.signature,
-      mint: transfer.mint || null,
-      action: incoming ? "BUY" : "SELL",
-      tokenAmount: Number(transfer.tokenAmount || transfer.amount || 0),
-      solAmount: Math.abs(netSol),
-      timestamp,
-      raw: tx,
-    };
+    return { signature:tx.signature,mint:transfer.mint || null,action:incoming ? "BUY" : "SELL",tokenAmount:Number(transfer.tokenAmount || transfer.amount || 0),solAmount:Math.abs(netSol),timestamp,raw:tx };
   }).filter(Boolean);
 }
 
@@ -196,65 +202,75 @@ async function ingestWallet(pool, wallet) {
   const transactions = await fetchWalletTransactions(wallet);
   let inserted = 0;
   for (const tx of transactions) {
-    await indexCounterparties(pool, tx, wallet);
-    for (const activity of parseActivities(wallet, tx)) {
+    await indexCounterparties(pool,tx,wallet);
+    for (const activity of parseActivities(wallet,tx)) {
       if (!activity.mint) continue;
-      await upsertToken(pool, activity.mint);
+      await upsertToken(pool,activity.mint);
       const result = await pool.query(
         `INSERT INTO whale_activity(signature,wallet_address,mint,action,token_amount,sol_amount,timestamp,raw)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(signature,wallet_address,mint,action) DO NOTHING`,
-        [activity.signature, wallet, activity.mint, activity.action, activity.tokenAmount, activity.solAmount, activity.timestamp, JSON.stringify(activity.raw)]
+        [activity.signature,wallet,activity.mint,activity.action,activity.tokenAmount,activity.solAmount,activity.timestamp,JSON.stringify(activity.raw)]
       );
       if (result.rowCount) inserted++;
     }
   }
-  await pool.query("UPDATE wallets SET last_seen_at=NOW(),updated_at=NOW() WHERE address=$1", [wallet]);
+  await pool.query("UPDATE wallets SET last_seen_at=NOW(),updated_at=NOW() WHERE address=$1",[wallet]);
   return inserted;
 }
 
 async function discoverFreshTokens(pool) {
   try {
     const response = await fetch("https://api.dexscreener.com/token-profiles/latest/v1");
-    if (!response.ok) return;
+    if (!response.ok) throw new Error(`DexScreener ${response.status}`);
     const profiles = await response.json();
-    for (const item of (Array.isArray(profiles) ? profiles : []).slice(0, 50)) {
+    let count = 0;
+    for (const item of (Array.isArray(profiles) ? profiles : []).slice(0,50)) {
       if (item.chainId !== "solana" || !item.tokenAddress) continue;
-      await upsertToken(pool, item.tokenAddress);
+      await upsertToken(pool,item.tokenAddress);
+      count++;
     }
+    ingestionState.freshTokensDiscovered = count;
   } catch (error) {
-    console.error("Fresh token discovery failed:", error.message || error);
+    console.error("Fresh token discovery failed:",error.message || error);
+  }
+}
+
+export async function runIngestionCycle(pool) {
+  if (ingestionState.running) return;
+  ingestionState.running = true;
+  ingestionState.lastRunAt = new Date().toISOString();
+  ingestionState.lastError = null;
+  try {
+    await ensureSchema(pool);
+    await discoverInitialWallets(pool);
+    await discoverFreshTokens(pool);
+    const refreshed = await pool.query("SELECT address FROM wallets ORDER BY balance_sol DESC NULLS LAST,last_seen_at DESC LIMIT 200");
+    const wallets = refreshed.rows.map(row => row.address);
+    ingestionState.walletsTracked = wallets.length;
+    let inserted = 0;
+    for (const wallet of wallets.slice(0,25)) {
+      try { inserted += await ingestWallet(pool,wallet); }
+      catch (error) { console.error(`Wallet ingestion failed for ${wallet}:`,error.message || error); }
+      await sleep(100);
+    }
+    ingestionState.activitiesInserted += inserted;
+    ingestionState.lastSuccessAt = new Date().toISOString();
+  } catch (error) {
+    ingestionState.lastError = error instanceof Error ? error.message : String(error);
+    console.error("Ingestion cycle failed:",error);
+  } finally {
+    ingestionState.running = false;
   }
 }
 
 export function startIngestion(pool) {
   if (!HELIUS_KEY) {
+    ingestionState.lastError = "HELIUS_API_KEY is missing";
     console.warn("Whale ingestion disabled: HELIUS_API_KEY is missing");
     return;
   }
-  let running = false;
-  let offset = 0;
-  const run = async () => {
-    if (running) return;
-    running = true;
-    try {
-      await ensureSchema(pool);
-      await discoverInitialWallets(pool);
-      await discoverFreshTokens(pool);
-      const refreshed = await pool.query("SELECT address FROM wallets ORDER BY balance_sol DESC NULLS LAST,last_seen_at DESC LIMIT 200");
-      const wallets = refreshed.rows.map((row) => row.address);
-      const batch = wallets.slice(offset, offset + 25);
-      offset = wallets.length ? (offset + 25) % wallets.length : 0;
-      for (const wallet of batch) {
-        try { await ingestWallet(pool, wallet); } catch (error) { console.error(`Wallet ingestion failed for ${wallet}:`, error.message || error); }
-        await sleep(100);
-      }
-    } catch (error) {
-      console.error("Ingestion cycle failed:", error.message || error);
-    } finally {
-      running = false;
-    }
-  };
-  run();
-  setInterval(run, 30000);
-  setInterval(() => discoverFreshTokens(pool), 60000);
+  ingestionState.startedAt = new Date().toISOString();
+  runIngestionCycle(pool);
+  setInterval(() => runIngestionCycle(pool),30000);
+  setInterval(() => discoverFreshTokens(pool),60000);
 }
