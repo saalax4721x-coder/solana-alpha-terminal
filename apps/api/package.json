@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "node src/server.js",
-    "start": "node src/migrate.js && node src/server.js"
+    "dev": "node src/launcher.js",
+    "start": "node src/migrate.js && node src/launcher.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.4",
