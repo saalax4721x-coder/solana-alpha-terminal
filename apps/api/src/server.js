@@ -40,7 +40,7 @@ app.get("/api/health", async (_req, res) => {
     } catch (error) {
       database = "error";
       databaseError = error instanceof Error ? error.message : String(error);
-      console.error("Database health check failed:", databaseError);
+      console.error("Database health check failed:", error);
     }
   }
 
