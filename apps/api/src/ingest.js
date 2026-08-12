@@ -1,18 +1,25 @@
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
-const RPC_URL = process.env.HELIUS_RPC_URL || (HELIUS_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}` : "https://api.mainnet-beta.solana.com");
+const HELIUS_RPC_URL = process.env.HELIUS_RPC_URL || (HELIUS_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}` : null);
+const PUBLIC_RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const HELIUS_TX_BASE = HELIUS_KEY ? `https://api.helius.xyz/v0/addresses` : null;
-const sleep = (ms) => new Promise((msResolve) => setTimeout(msResolve, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const ingestionState = {
   running:false, startedAt:null, lastRunAt:null, lastSuccessAt:null, lastError:null,
-  walletsDiscovered:0, walletsTracked:0, activitiesInserted:0, freshTokensDiscovered:0, rpcDiscovery:null,
+  walletsDiscovered:0, walletsTracked:0, activitiesInserted:0, freshTokensDiscovered:0,
+  rpcDiscovery:null,
 };
 
-async function rpc(method, params = []) {
-  const response = await fetch(RPC_URL,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:Date.now(),method,params})});
+async function rpc(url, method, params = []) {
+  const response = await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:Date.now(),method,params})});
   const text=await response.text();
   if(!response.ok)throw new Error(`Solana RPC ${response.status}: ${text.slice(0,300)}`);
   const json=JSON.parse(text); if(json.error)throw new Error(json.error.message||"Solana RPC error"); return json.result;
+}
+
+async function heliusRpc(method, params = []) {
+  if (!HELIUS_RPC_URL) throw new Error("HELIUS_RPC_URL is not configured");
+  return rpc(HELIUS_RPC_URL, method, params);
 }
 
 async function ensureSchema(pool){await pool.query(`
@@ -24,50 +31,62 @@ CREATE INDEX IF NOT EXISTS idx_whale_activity_time ON whale_activity(timestamp D
 
 async function saveWallet(pool,address,label="Whale",balance=0){if(!address)return;await pool.query(`INSERT INTO wallets(address,label,balance_sol,last_seen_at,updated_at) VALUES($1,$2,$3,NOW(),NOW()) ON CONFLICT(address) DO UPDATE SET label=CASE WHEN wallets.label='Whale' THEN wallets.label ELSE EXCLUDED.label END,balance_sol=GREATEST(COALESCE(wallets.balance_sol,0),COALESCE(EXCLUDED.balance_sol,0)),last_seen_at=NOW(),updated_at=NOW()`,[address,label,balance]);}
 
+function decodeOwnerFromTokenAccount(data){
+  try{
+    const encoded=Array.isArray(data)?data[0]:null;
+    if(typeof encoded!=="string")return null;
+    const bytes=Buffer.from(encoded,"base64");
+    if(bytes.length<64)return null;
+    return Buffer.from(bytes.subarray(32,64)).toString("base64");
+  }catch{return null;}
+}
+
 async function discoverInitialWallets(pool){
   let discovered=0;
+  const source={method:"public getTokenLargestAccounts + getMultipleAccounts",tokensScanned:0,tokenAccountsSeen:0,holdersFound:0};
   try{
-    // getLargestAccounts returns the largest SOL accounts, but many are program/infra accounts.
-    // We use it only as a seed source, then discover actual wallet owners from token holders.
-    const largest=await rpc("getLargestAccounts",[{commitment:"confirmed"}]);
-    const largestAccounts=Array.isArray(largest?.value)?largest.value:[];
-    ingestionState.rpcDiscovery={ok:true,largestAccounts:largestAccounts.length,method:"getLargestAccounts+getTokenAccounts"};
-
-    // Discover holders from the tokens already being indexed. Helius getTokenAccounts returns
-    // owner addresses directly, avoiding token-account/program addresses being mislabeled as whales.
-    const tokenRows=await pool.query(`SELECT mint FROM tokens ORDER BY last_seen_at DESC LIMIT 40`);
+    const tokenRows=await pool.query(`SELECT mint FROM tokens WHERE market_cap_usd IS NOT NULL OR liquidity_usd IS NOT NULL ORDER BY liquidity_usd DESC NULLS LAST, last_seen_at DESC LIMIT 30`);
     const candidates=new Map();
+
     for(const row of tokenRows.rows){
       try{
-        const result=await rpc("getTokenAccounts",{mint:row.mint,page:1,limit:100});
-        const accounts=Array.isArray(result?.token_accounts)?result.token_accounts:[];
-        for(const account of accounts){
-          const owner=String(account?.owner||"").trim(); if(!owner)continue;
-          const amount=Number(account?.amount||0);
-          const previous=candidates.get(owner)||0; candidates.set(owner,previous+amount);
+        const largest=await rpc(PUBLIC_RPC_URL,"getTokenLargestAccounts",[row.mint,{commitment:"confirmed"}]);
+        const accounts=Array.isArray(largest?.value)?largest.value:[];
+        source.tokensScanned++;
+        source.tokenAccountsSeen+=accounts.length;
+        const pubkeys=accounts.map(x=>x?.address).filter(Boolean).slice(0,20);
+        if(!pubkeys.length)continue;
+        const info=await rpc(PUBLIC_RPC_URL,"getMultipleAccounts",[pubkeys,{encoding:"base64",commitment:"confirmed"}]);
+        for(const item of info?.value||[]){
+          const ownerBytes=(()=>{try{const encoded=item?.data?.[0];if(typeof encoded!=="string")return null;const bytes=Buffer.from(encoded,"base64");if(bytes.length<64)return null;return bytes.subarray(32,64);}catch{return null;}})();
+          if(!ownerBytes)continue;
+          const owner=Buffer.from(ownerBytes).toString("base64");
+          if(!owner)continue;
+          // Convert raw 32-byte public key to base58 without adding a dependency.
+          const alphabet="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+          let n=BigInt("0x"+Buffer.from(ownerBytes).toString("hex")); let out="";
+          while(n>0n){const r=Number(n%58n);out=alphabet[r]+out;n=n/58n;}
+          for(const b of ownerBytes)if(b===0)out="1"+out;else break;
+          const current=candidates.get(out)||0;candidates.set(out,current+1);source.holdersFound++;
         }
-      }catch(error){console.warn(`Holder discovery failed for ${row.mint}:`,error.message||error);}
-      await sleep(50);
-      if(candidates.size>=300)break;
+      }catch(error){console.warn(`Holder bootstrap failed for ${row.mint}:`,error.message||error);}
+      await sleep(75);
+      if(candidates.size>=500)break;
     }
 
     const ranked=[...candidates.entries()].sort((a,b)=>b[1]-a[1]).slice(0,200);
     for(const [address] of ranked){await saveWallet(pool,address,"Whale");discovered++;}
-
     const configured=(process.env.TRACKED_WALLETS||"").split(",").map(x=>x.trim()).filter(Boolean).slice(0,500);
     for(const address of configured)await saveWallet(pool,address,"Tracked");
-
-    // If token-holder discovery has not produced enough wallets yet, retain any valid configured
-    // seeds and do not pretend program accounts are wallets.
     ingestionState.walletsDiscovered=discovered;
-    ingestionState.rpcDiscovery={...ingestionState.rpcDiscovery,holderCandidates:candidates.size,walletsSaved:discovered};
+    ingestionState.rpcDiscovery={ok:true,...source,walletsSaved:discovered};
     return discovered;
-  }catch(error){ingestionState.rpcDiscovery={ok:false,error:error instanceof Error?error.message:String(error)};throw error;}
+  }catch(error){ingestionState.rpcDiscovery={ok:false,...source,error:error instanceof Error?error.message:String(error)};throw error;}
 }
 
 async function fetchWalletTransactions(address){if(!HELIUS_TX_BASE)return[];const response=await fetch(`${HELIUS_TX_BASE}/${encodeURIComponent(address)}/transactions?api-key=${encodeURIComponent(HELIUS_KEY)}&limit=20`);const text=await response.text();if(!response.ok)throw new Error(`Helius transactions ${response.status}: ${text.slice(0,300)}`);const json=JSON.parse(text);return Array.isArray(json)?json:[];}
 
-async function getTokenMetadata(mint){try{const[asset,marketResponse]=await Promise.all([rpc("getAsset",[mint]),fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`).catch(()=>null)]);const metadata=asset?.content?.metadata||{};const tokenInfo=asset?.token_info||{};let market={};if(marketResponse?.ok){const json=await marketResponse.json();const pair=(json.pairs||[]).sort((a,b)=>Number(b.liquidity?.usd||0)-Number(a.liquidity?.usd||0))[0];if(pair)market={price_usd:Number(pair.priceUsd||0)||null,liquidity_usd:Number(pair.liquidity?.usd||0)||null,volume_24h_usd:Number(pair.volume?.h24||0)||null,market_cap_usd:Number(pair.marketCap||pair.fdv||0)||null};}return{symbol:metadata.symbol||tokenInfo.symbol||null,name:metadata.name||null,image_url:asset?.content?.links?.image||null,decimals:tokenInfo.decimals??null,...market,metadata:asset||{}};}catch(error){console.warn(`Token metadata failed for ${mint}:`,error.message||error);return{symbol:null,name:null,image_url:null,decimals:null,price_usd:null,liquidity_usd:null,volume_24h_usd:null,market_cap_usd:null,metadata:{}};}}
+async function getTokenMetadata(mint){try{const[asset,marketResponse]=await Promise.all([heliusRpc("getAsset",[mint]),fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`).catch(()=>null)]);const metadata=asset?.content?.metadata||{};const tokenInfo=asset?.token_info||{};let market={};if(marketResponse?.ok){const json=await marketResponse.json();const pair=(json.pairs||[]).sort((a,b)=>Number(b.liquidity?.usd||0)-Number(a.liquidity?.usd||0))[0];if(pair)market={price_usd:Number(pair.priceUsd||0)||null,liquidity_usd:Number(pair.liquidity?.usd||0)||null,volume_24h_usd:Number(pair.volume?.h24||0)||null,market_cap_usd:Number(pair.marketCap||pair.fdv||0)||null};}return{symbol:metadata.symbol||tokenInfo.symbol||null,name:metadata.name||null,image_url:asset?.content?.links?.image||null,decimals:tokenInfo.decimals??null,...market,metadata:asset||{}};}catch(error){console.warn(`Token metadata failed for ${mint}:`,error.message||error);return{symbol:null,name:null,image_url:null,decimals:null,price_usd:null,liquidity_usd:null,volume_24h_usd:null,market_cap_usd:null,metadata:{}};}}
 
 async function upsertToken(pool,mint){const m=await getTokenMetadata(mint);await pool.query(`INSERT INTO tokens(mint,symbol,name,image_url,decimals,market_cap_usd,price_usd,liquidity_usd,volume_24h_usd,metadata,last_seen_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) ON CONFLICT(mint) DO UPDATE SET symbol=COALESCE(EXCLUDED.symbol,tokens.symbol),name=COALESCE(EXCLUDED.name,tokens.name),image_url=COALESCE(EXCLUDED.image_url,tokens.image_url),decimals=COALESCE(EXCLUDED.decimals,tokens.decimals),market_cap_usd=COALESCE(EXCLUDED.market_cap_usd,tokens.market_cap_usd),price_usd=COALESCE(EXCLUDED.price_usd,tokens.price_usd),liquidity_usd=COALESCE(EXCLUDED.liquidity_usd,tokens.liquidity_usd),volume_24h_usd=COALESCE(EXCLUDED.volume_24h_usd,tokens.volume_24h_usd),metadata=EXCLUDED.metadata,last_seen_at=NOW()`,[mint,m.symbol,m.name,m.image_url,m.decimals,m.market_cap_usd,m.price_usd,m.liquidity_usd,m.volume_24h_usd,JSON.stringify(m.metadata)]);}
 
