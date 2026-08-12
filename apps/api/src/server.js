@@ -14,7 +14,10 @@ const databaseUrl = process.env.DATABASE_URL;
 const pool = databaseUrl
   ? new Pool({
       connectionString: databaseUrl,
-      ssl: databaseUrl.includes("railway") ? { rejectUnauthorized: false } : undefined,
+      ssl: { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
     })
   : null;
 
@@ -22,19 +25,22 @@ app.get("/", (_req, res) => {
   res.json({
     service: "Solana Alpha Terminal API",
     status: "online",
-    version: "0.1.0",
+    version: "0.1.1",
   });
 });
 
 app.get("/api/health", async (_req, res) => {
   let database = "not configured";
+  let databaseError = null;
 
   if (pool) {
     try {
       await pool.query("SELECT 1");
       database = "connected";
-    } catch {
+    } catch (error) {
       database = "error";
+      databaseError = error instanceof Error ? error.message : String(error);
+      console.error("Database health check failed:", databaseError);
     }
   }
 
@@ -42,6 +48,7 @@ app.get("/api/health", async (_req, res) => {
     status: database === "connected" ? "ok" : "degraded",
     heliusConfigured: Boolean(process.env.HELIUS_API_KEY),
     database,
+    ...(databaseError ? { databaseError } : {}),
     timestamp: new Date().toISOString(),
   });
 });
